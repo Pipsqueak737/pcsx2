@@ -906,6 +906,13 @@ struct Pcsx2Config
 		u8 ShadeBoost_Contrast = DEFAULT_SHADEBOOST_CONTRAST;
 		u8 ShadeBoost_Saturation = DEFAULT_SHADEBOOST_SATURATION;
 		u8 ShadeBoost_Gamma = DEFAULT_SHADEBOOST_GAMMA;
+
+		// Anti-flicker: blends pixels that alternate every frame (flicker-based transparency).
+		// Vulkan only for now. Needs proper testing.
+		bool AntiFlicker = false;
+		float AntiFlicker_Threshold = 0.20f; // Minimum luma difference between consecutive frames.
+		float AntiFlicker_StartRow = 0.0f; // Only detect between these rows (fraction of frame height).
+		float AntiFlicker_EndRow = 1.0f;
 		u8 PNGCompressionLevel = 1;
 
 		u16 SWExtraThreads = 2;

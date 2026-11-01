@@ -1489,6 +1489,7 @@ protected:
 	static constexpr u32 MAX_POOLED_TEXTURES = 300;
 	static constexpr u32 MAX_TEXTURE_AGE = 10;
 	static constexpr u32 NUM_CAS_CONSTANTS = 12; // 8 plus src offset x/y, 16 byte alignment
+	static constexpr int ANTIFLICKER_SLOTS = 6; // current frame + 5 frames of history
 	static constexpr u32 EXPAND_BUFFER_SIZE = sizeof(u16) * 16383 * 6;
 
 	WindowInfo m_window_info;
@@ -1501,6 +1502,11 @@ protected:
 	GSTexture* m_blend = nullptr;
 	GSTexture* m_mad = nullptr;
 	GSTexture* m_target_tmp = nullptr;
+	GSTexture* m_aflicker_history = nullptr; ///< Ring of the last ANTIFLICKER_SLOTS raw frames, stacked vertically.
+	GSTexture* m_aflicker_out = nullptr;
+	int m_aflicker_head = 0; ///< Ring slot holding the most recent frame.
+	int m_aflicker_valid = 0; ///< Number of frames written since the ring was (re)created.
+	bool m_aflicker_failed = false;
 	GSTexture* m_current = nullptr;
 	GSTexture* m_cas = nullptr;
 	GSTexture* m_blur = nullptr;
@@ -1519,6 +1525,11 @@ protected:
 	virtual void DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect, ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb) = 0;
 	virtual void DoFXAA(GSTexture* sTex, GSTexture* dTex) = 0;
 	virtual void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) = 0;
+
+	/// Anti-flicker is only implemented by some backends; the others leave the frame untouched.
+	virtual bool SupportsAntiFlicker() const { return false; }
+	/// history: ANTIFLICKER_SLOTS frames stacked vertically. params: see GSDevice::AntiFlicker().
+	virtual bool DoAntiFlicker(GSTexture* history, GSTexture* dTex, const float params[8]) { return false; }
 
 	/// Resolves CAS shader includes for the specified source.
 	static bool GetCASShaderSource(std::string* source);
@@ -1733,6 +1744,8 @@ public:
 	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset);
 	void FXAA();
 	void ShadeBoost();
+	void AntiFlicker();
+	void ResetAntiFlicker();
 	void Resize(int width, int height);
 
 	void CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only);

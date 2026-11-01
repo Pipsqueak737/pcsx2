@@ -243,6 +243,12 @@ bool GSRenderer::Merge(int field)
 		g_gs_device->Interlace(fs, field ^ field2, mode, offset);
 	}
 
+	// Before the other post-processing: detection works on the raw merged frame.
+	if (GSConfig.AntiFlicker)
+		g_gs_device->AntiFlicker();
+	else
+		g_gs_device->ResetAntiFlicker();
+
 	if (GSConfig.ShadeBoost)
 		g_gs_device->ShadeBoost();
 

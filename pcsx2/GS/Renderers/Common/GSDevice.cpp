@@ -1010,6 +1010,8 @@ void GSDevice::ClearCurrent()
 	delete m_blend;
 	delete m_mad;
 	delete m_target_tmp;
+	delete m_aflicker_history;
+	delete m_aflicker_out;
 	delete m_cas;
 	delete m_blur;
 
@@ -1018,6 +1020,11 @@ void GSDevice::ClearCurrent()
 	m_blend = nullptr;
 	m_mad = nullptr;
 	m_target_tmp = nullptr;
+	m_aflicker_history = nullptr;
+	m_aflicker_out = nullptr;
+	m_aflicker_head = 0;
+	m_aflicker_valid = 0;
+	m_aflicker_failed = false;
 	m_cas = nullptr;
 	m_blur = nullptr;
 }
@@ -1124,6 +1131,92 @@ void GSDevice::ShadeBoost()
 
 		m_current = m_target_tmp;
 	}
+}
+
+void GSDevice::ResetAntiFlicker()
+{
+	// Never called while m_current is m_aflicker_out: Merge() always restarts from m_merge.
+	if (m_aflicker_history || m_aflicker_out)
+	{
+		delete m_aflicker_history;
+		delete m_aflicker_out;
+		m_aflicker_history = nullptr;
+		m_aflicker_out = nullptr;
+	}
+
+	m_aflicker_head = 0;
+	m_aflicker_valid = 0;
+	m_aflicker_failed = false;
+}
+
+// Port of the RetroArch "anti-flicker" shader (hunterk, extended by crashGG).
+//
+// Games that fake transparency by drawing a sprite/layer on alternate frames show up as pixels whose
+// luma alternates between two values every frame. We keep the raw output of the last
+// ANTIFLICKER_SLOTS frames and, for pixels that alternate consistently, output a blend of the
+// current and previous frame instead.
+//
+// The utility pipelines only have a single sampler, so the history is stored as one tall texture
+// (ANTIFLICKER_SLOTS frames stacked vertically) used as a ring buffer, and the shader picks the slot
+// with texelFetch(). Needs proper testing.
+void GSDevice::AntiFlicker()
+{
+	if (m_aflicker_failed)
+		return;
+
+	if (!SupportsAntiFlicker())
+	{
+		m_aflicker_failed = true;
+		Console.Warning("GS: Anti-flicker is not supported by this renderer (Vulkan only), ignoring.");
+		return;
+	}
+
+	const int w = m_current->GetWidth();
+	const int h = m_current->GetHeight();
+
+	// Frame size changed (resolution/upscale change): the history is meaningless, start over.
+	if (m_aflicker_history &&
+		(m_aflicker_history->GetWidth() != w || m_aflicker_history->GetHeight() != h * ANTIFLICKER_SLOTS ||
+			m_aflicker_history->GetFormat() != m_current->GetFormat()))
+	{
+		ResetAntiFlicker();
+	}
+
+	if (!m_aflicker_history)
+	{
+		if (m_current->GetFormat() != GSTexture::Format::Color ||
+			!ResizeRenderTarget(&m_aflicker_history, w, h * ANTIFLICKER_SLOTS, false, false))
+		{
+			Console.Warning("GS: Failed to allocate the %dx%d anti-flicker history texture, disabling.", w, h * ANTIFLICKER_SLOTS);
+			m_aflicker_failed = true;
+			return;
+		}
+
+		m_aflicker_head = 0;
+		m_aflicker_valid = 0;
+	}
+
+	// Store this frame's raw output in the next ring slot (overwriting the oldest frame).
+	m_aflicker_head = (m_aflicker_head + 1) % ANTIFLICKER_SLOTS;
+	CopyRect(m_current, m_aflicker_history, GSVector4i(0, 0, w, h), 0, static_cast<u32>(m_aflicker_head * h));
+	m_aflicker_valid = std::min(m_aflicker_valid + 1, ANTIFLICKER_SLOTS);
+
+	if (!ResizeRenderTarget(&m_aflicker_out, w, h, false, false))
+		return;
+
+	const float params[8] = {
+		static_cast<float>(m_aflicker_head), // x: slot holding the current frame
+		GSConfig.AntiFlicker_Threshold, // y: luma difference threshold
+		GSConfig.AntiFlicker_StartRow, // z: detection window start (fraction of height)
+		GSConfig.AntiFlicker_EndRow, // w: detection window end
+		(m_aflicker_valid >= ANTIFLICKER_SLOTS) ? 1.0f : 0.0f, // x: history fully populated
+		0.0f,
+		0.0f,
+		0.0f,
+	};
+
+	if (DoAntiFlicker(m_aflicker_history, m_aflicker_out, params))
+		m_current = m_aflicker_out;
 }
 
 void GSDevice::Resize(int width, int height)

@@ -1,0 +1,438 @@
+diff --git a/bin/resources/shaders/vulkan/antiflicker.glsl b/bin/resources/shaders/vulkan/antiflicker.glsl
+new file mode 100644
+index 0000000..759ac03
+--- /dev/null
++++ b/bin/resources/shaders/vulkan/antiflicker.glsl
+@@ -0,0 +1,105 @@
++// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
++// SPDX-License-Identifier: GPL-3.0+
++
++//#version 420 // Keep it for editor detection
++
++// Anti-flicker: port of the RetroArch shader of the same name.
++//   Original by hunterk (public domain), extended and optimized by crashGG.
++//
++// Detects pixels that alternate between bright and dark every frame (flicker-based
++// transparency) and outputs a blend of the current and previous frame for them.
++//
++// samp0 is the frame-history ring: ANTIFLICKER_SLOTS (6) frames stacked vertically in one
++// texture. params0.x is the slot holding the current frame, older frames are the preceding
++// slots (wrapping around).
++
++#ifdef VERTEX_SHADER
++
++layout(location = 0) in vec4 a_pos;
++layout(location = 1) in vec2 a_tex;
++
++layout(location = 0) out vec2 v_tex;
++
++void main()
++{
++	gl_Position = vec4(a_pos.x, -a_pos.y, a_pos.z, a_pos.w);
++	v_tex = a_tex;
++}
++
++#endif
++
++#ifdef FRAGMENT_SHADER
++
++layout(push_constant) uniform cb0
++{
++	vec4 params0; // x = ring slot of the current frame, y = luma threshold, z = start row, w = end row
++	vec4 params1; // x = 1.0 once the ring holds a full set of frames
++};
++
++layout(set = 0, binding = 0) uniform sampler2D samp0;
++layout(location = 0) in vec2 v_tex;
++layout(location = 0) out vec4 o_col0;
++
++const int SLOTS = 6;
++
++// age 0 = current frame, 1 = previous frame, ... 5 = five frames ago
++vec4 FetchFrame(int age, int frame_height)
++{
++	int slot = (int(params0.x + 0.5) - age + SLOTS) % SLOTS;
++	ivec2 pos = ivec2(gl_FragCoord.xy) + ivec2(0, slot * frame_height);
++	return texelFetch(samp0, pos, 0);
++}
++
++// BT.601 luma
++float Luma(vec3 c)
++{
++	return dot(c, vec3(0.299, 0.587, 0.114));
++}
++
++void main()
++{
++	const int frame_height = textureSize(samp0, 0).y / SLOTS;
++
++	vec4 cur = FetchFrame(0, frame_height);
++	o_col0 = cur;
++
++	// Not enough history yet (first frames after enabling / a resolution change).
++	if (params1.x < 0.5)
++		return;
++
++	// Only detect inside [start row, end row] (fractions of the frame height).
++	float row = gl_FragCoord.y / float(frame_height);
++	if (row < params0.z || row > params0.w)
++		return;
++
++	vec3 prev1 = FetchFrame(1, frame_height).rgb;
++
++	float l0 = Luma(cur.rgb);
++	float l1 = Luma(prev1);
++	float l2 = Luma(FetchFrame(2, frame_height).rgb);
++	float l3 = Luma(FetchFrame(3, frame_height).rgb);
++	float l4 = Luma(FetchFrame(4, frame_height).rgb);
++	float l5 = Luma(FetchFrame(5, frame_height).rgb);
++
++	// Alternating-frame lock: the even or the odd frame sequence must stay constant...
++	bool chain024 = abs(l0 - l2) < 0.01 && abs(l2 - l4) < 0.01;
++	bool chain135 = abs(l1 - l3) < 0.01 && abs(l3 - l5) < 0.01;
++
++	// ...while consecutive frames differ by more than the threshold, three times in a row.
++	bool flicker = (chain024 || chain135)
++		&& abs(l0 - l1) > params0.y
++		&& abs(l2 - l3) > params0.y
++		&& abs(l4 - l5) > params0.y;
++
++	if (flicker)
++	{
++		// Sum & delta with a floor on the dark end, then a 1st-order Taylor expansion of the
++		// original pow()-based blend.
++		vec3 sum = max(cur.rgb, vec3(0.05)) + max(prev1, vec3(0.05));
++		vec3 inv_sum = vec3(1.0) / sum;
++		vec3 diff = cur.rgb - prev1;
++		o_col0.rgb = sum * 0.5 + diff * diff * inv_sum * 0.25;
++	}
++}
++
++#endif
+diff --git a/pcsx2/Config.h b/pcsx2/Config.h
+index 21adcf1..b0a211e 100644
+--- a/pcsx2/Config.h
++++ b/pcsx2/Config.h
+@@ -906,6 +906,13 @@ struct Pcsx2Config
+ 		u8 ShadeBoost_Contrast = DEFAULT_SHADEBOOST_CONTRAST;
+ 		u8 ShadeBoost_Saturation = DEFAULT_SHADEBOOST_SATURATION;
+ 		u8 ShadeBoost_Gamma = DEFAULT_SHADEBOOST_GAMMA;
++
++		// Anti-flicker: blends pixels that alternate every frame (flicker-based transparency).
++		// Vulkan only for now. Needs proper testing.
++		bool AntiFlicker = false;
++		float AntiFlicker_Threshold = 0.20f; // Minimum luma difference between consecutive frames.
++		float AntiFlicker_StartRow = 0.0f; // Only detect between these rows (fraction of frame height).
++		float AntiFlicker_EndRow = 1.0f;
+ 		u8 PNGCompressionLevel = 1;
+ 
+ 		u16 SWExtraThreads = 2;
+diff --git a/pcsx2/GS/Renderers/Common/GSDevice.cpp b/pcsx2/GS/Renderers/Common/GSDevice.cpp
+index b3c8d65..aa858b7 100644
+--- a/pcsx2/GS/Renderers/Common/GSDevice.cpp
++++ b/pcsx2/GS/Renderers/Common/GSDevice.cpp
+@@ -1010,6 +1010,8 @@ void GSDevice::ClearCurrent()
+ 	delete m_blend;
+ 	delete m_mad;
+ 	delete m_target_tmp;
++	delete m_aflicker_history;
++	delete m_aflicker_out;
+ 	delete m_cas;
+ 	delete m_blur;
+ 
+@@ -1018,6 +1020,11 @@ void GSDevice::ClearCurrent()
+ 	m_blend = nullptr;
+ 	m_mad = nullptr;
+ 	m_target_tmp = nullptr;
++	m_aflicker_history = nullptr;
++	m_aflicker_out = nullptr;
++	m_aflicker_head = 0;
++	m_aflicker_valid = 0;
++	m_aflicker_failed = false;
+ 	m_cas = nullptr;
+ 	m_blur = nullptr;
+ }
+@@ -1126,6 +1133,92 @@ void GSDevice::ShadeBoost()
+ 	}
+ }
+ 
++void GSDevice::ResetAntiFlicker()
++{
++	// Never called while m_current is m_aflicker_out: Merge() always restarts from m_merge.
++	if (m_aflicker_history || m_aflicker_out)
++	{
++		delete m_aflicker_history;
++		delete m_aflicker_out;
++		m_aflicker_history = nullptr;
++		m_aflicker_out = nullptr;
++	}
++
++	m_aflicker_head = 0;
++	m_aflicker_valid = 0;
++	m_aflicker_failed = false;
++}
++
++// Port of the RetroArch "anti-flicker" shader (hunterk, extended by crashGG).
++//
++// Games that fake transparency by drawing a sprite/layer on alternate frames show up as pixels whose
++// luma alternates between two values every frame. We keep the raw output of the last
++// ANTIFLICKER_SLOTS frames and, for pixels that alternate consistently, output a blend of the
++// current and previous frame instead.
++//
++// The utility pipelines only have a single sampler, so the history is stored as one tall texture
++// (ANTIFLICKER_SLOTS frames stacked vertically) used as a ring buffer, and the shader picks the slot
++// with texelFetch(). Needs proper testing.
++void GSDevice::AntiFlicker()
++{
++	if (m_aflicker_failed)
++		return;
++
++	if (!SupportsAntiFlicker())
++	{
++		m_aflicker_failed = true;
++		Console.Warning("GS: Anti-flicker is not supported by this renderer (Vulkan only), ignoring.");
++		return;
++	}
++
++	const int w = m_current->GetWidth();
++	const int h = m_current->GetHeight();
++
++	// Frame size changed (resolution/upscale change): the history is meaningless, start over.
++	if (m_aflicker_history &&
++		(m_aflicker_history->GetWidth() != w || m_aflicker_history->GetHeight() != h * ANTIFLICKER_SLOTS ||
++			m_aflicker_history->GetFormat() != m_current->GetFormat()))
++	{
++		ResetAntiFlicker();
++	}
++
++	if (!m_aflicker_history)
++	{
++		if (m_current->GetFormat() != GSTexture::Format::Color ||
++			!ResizeRenderTarget(&m_aflicker_history, w, h * ANTIFLICKER_SLOTS, false, false))
++		{
++			Console.Warning("GS: Failed to allocate the %dx%d anti-flicker history texture, disabling.", w, h * ANTIFLICKER_SLOTS);
++			m_aflicker_failed = true;
++			return;
++		}
++
++		m_aflicker_head = 0;
++		m_aflicker_valid = 0;
++	}
++
++	// Store this frame's raw output in the next ring slot (overwriting the oldest frame).
++	m_aflicker_head = (m_aflicker_head + 1) % ANTIFLICKER_SLOTS;
++	CopyRect(m_current, m_aflicker_history, GSVector4i(0, 0, w, h), 0, static_cast<u32>(m_aflicker_head * h));
++	m_aflicker_valid = std::min(m_aflicker_valid + 1, ANTIFLICKER_SLOTS);
++
++	if (!ResizeRenderTarget(&m_aflicker_out, w, h, false, false))
++		return;
++
++	const float params[8] = {
++		static_cast<float>(m_aflicker_head), // x: slot holding the current frame
++		GSConfig.AntiFlicker_Threshold, // y: luma difference threshold
++		GSConfig.AntiFlicker_StartRow, // z: detection window start (fraction of height)
++		GSConfig.AntiFlicker_EndRow, // w: detection window end
++		(m_aflicker_valid >= ANTIFLICKER_SLOTS) ? 1.0f : 0.0f, // x: history fully populated
++		0.0f,
++		0.0f,
++		0.0f,
++	};
++
++	if (DoAntiFlicker(m_aflicker_history, m_aflicker_out, params))
++		m_current = m_aflicker_out;
++}
++
+ void GSDevice::Resize(int width, int height)
+ {
+ 	GSTexture*& dTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
+diff --git a/pcsx2/GS/Renderers/Common/GSDevice.h b/pcsx2/GS/Renderers/Common/GSDevice.h
+index 421f8ea..32bfcda 100644
+--- a/pcsx2/GS/Renderers/Common/GSDevice.h
++++ b/pcsx2/GS/Renderers/Common/GSDevice.h
+@@ -1489,6 +1489,7 @@ protected:
+ 	static constexpr u32 MAX_POOLED_TEXTURES = 300;
+ 	static constexpr u32 MAX_TEXTURE_AGE = 10;
+ 	static constexpr u32 NUM_CAS_CONSTANTS = 12; // 8 plus src offset x/y, 16 byte alignment
++	static constexpr int ANTIFLICKER_SLOTS = 6; // current frame + 5 frames of history
+ 	static constexpr u32 EXPAND_BUFFER_SIZE = sizeof(u16) * 16383 * 6;
+ 
+ 	WindowInfo m_window_info;
+@@ -1501,6 +1502,11 @@ protected:
+ 	GSTexture* m_blend = nullptr;
+ 	GSTexture* m_mad = nullptr;
+ 	GSTexture* m_target_tmp = nullptr;
++	GSTexture* m_aflicker_history = nullptr; ///< Ring of the last ANTIFLICKER_SLOTS raw frames, stacked vertically.
++	GSTexture* m_aflicker_out = nullptr;
++	int m_aflicker_head = 0; ///< Ring slot holding the most recent frame.
++	int m_aflicker_valid = 0; ///< Number of frames written since the ring was (re)created.
++	bool m_aflicker_failed = false;
+ 	GSTexture* m_current = nullptr;
+ 	GSTexture* m_cas = nullptr;
+ 	GSTexture* m_blur = nullptr;
+@@ -1520,6 +1526,11 @@ protected:
+ 	virtual void DoFXAA(GSTexture* sTex, GSTexture* dTex) = 0;
+ 	virtual void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) = 0;
+ 
++	/// Anti-flicker is only implemented by some backends; the others leave the frame untouched.
++	virtual bool SupportsAntiFlicker() const { return false; }
++	/// history: ANTIFLICKER_SLOTS frames stacked vertically. params: see GSDevice::AntiFlicker().
++	virtual bool DoAntiFlicker(GSTexture* history, GSTexture* dTex, const float params[8]) { return false; }
++
+ 	/// Resolves CAS shader includes for the specified source.
+ 	static bool GetCASShaderSource(std::string* source);
+ 
+@@ -1733,6 +1744,8 @@ public:
+ 	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset);
+ 	void FXAA();
+ 	void ShadeBoost();
++	void AntiFlicker();
++	void ResetAntiFlicker();
+ 	void Resize(int width, int height);
+ 
+ 	void CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only);
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+index 35ab6fc..1899606 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
+@@ -243,6 +243,12 @@ bool GSRenderer::Merge(int field)
+ 		g_gs_device->Interlace(fs, field ^ field2, mode, offset);
+ 	}
+ 
++	// Before the other post-processing: detection works on the raw merged frame.
++	if (GSConfig.AntiFlicker)
++		g_gs_device->AntiFlicker();
++	else
++		g_gs_device->ResetAntiFlicker();
++
+ 	if (GSConfig.ShadeBoost)
+ 		g_gs_device->ShadeBoost();
+ 
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+index 567d2ca..a91fe2a 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
+@@ -3595,6 +3595,33 @@ void GSDeviceVK::DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float para
+ 	static_cast<GSTextureVK*>(dTex)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
+ }
+ 
++bool GSDeviceVK::DoAntiFlicker(GSTexture* history, GSTexture* dTex, const float params[8])
++{
++	if (m_antiflicker_pipeline == VK_NULL_HANDLE)
++		return false;
++
++	const GSVector4 sRect = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
++	const GSVector4i dRect = dTex->GetRect();
++	EndRenderPass();
++
++	// The history was just written by CopyRect(); make it sampleable before the render pass begins.
++	GSTextureVK* const history_vk = static_cast<GSTextureVK*>(history);
++	history_vk->SetUseFenceCounter(GetCurrentFenceCounter());
++	history_vk->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
++
++	OMSetRenderTargets(dTex, nullptr, dRect);
++	SetUtilityTexture(history, m_point_sampler);
++	BeginRenderPass(m_utility_color_render_pass_discard, dRect);
++	dTex->SetState(GSTexture::State::Dirty);
++	SetPipeline(m_antiflicker_pipeline);
++	SetUtilityPushConstants(params, sizeof(float) * 8);
++	DrawStretchRect(sRect, GSVector4(dRect), dTex->GetSize());
++	EndRenderPass();
++
++	static_cast<GSTextureVK*>(dTex)->TransitionToLayout(GSTextureVK::Layout::ShaderReadOnly);
++	return true;
++}
++
+ void GSDeviceVK::DoFXAA(GSTexture* sTex, GSTexture* dTex)
+ {
+ 	const GSVector4 sRect = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+@@ -4610,6 +4637,34 @@ bool GSDeviceVK::CompilePostProcessingPipelines()
+ 		Vulkan::SetObjectName(m_device, m_shadeboost_pipeline, "Shadeboost pipeline");
+ 	}
+ 
++	{
++		const std::optional<std::string> shader = ReadShaderSource("shaders/vulkan/antiflicker.glsl");
++		if (!shader)
++		{
++			Host::ReportErrorAsync("GS", "Failed to read shaders/vulkan/antiflicker.glsl.");
++			return false;
++		}
++
++		VkShaderModule vs = GetUtilityVertexShader(*shader);
++		ScopedGuard vs_guard([this, &vs]() { vkDestroyShaderModule(m_device, vs, nullptr); });
++		if (vs == VK_NULL_HANDLE)
++			return false;
++
++		VkShaderModule ps = GetUtilityFragmentShader(*shader);
++		ScopedGuard ps_guard([this, &ps]() { vkDestroyShaderModule(m_device, ps, nullptr); });
++		if (ps == VK_NULL_HANDLE)
++			return false;
++
++		gpb.SetVertexShader(vs);
++		gpb.SetFragmentShader(ps);
++
++		m_antiflicker_pipeline = gpb.Create(m_device, g_vulkan_shader_cache->GetPipelineCache(true), false);
++		if (!m_antiflicker_pipeline)
++			return false;
++
++		Vulkan::SetObjectName(m_device, m_antiflicker_pipeline, "Anti-flicker pipeline");
++	}
++
+ 	return true;
+ }
+ 
+@@ -4898,6 +4953,8 @@ void GSDeviceVK::DestroyResources()
+ 		vkDestroyPipeline(m_device, m_fxaa_pipeline, nullptr);
+ 	if (m_shadeboost_pipeline != VK_NULL_HANDLE)
+ 		vkDestroyPipeline(m_device, m_shadeboost_pipeline, nullptr);
++	if (m_antiflicker_pipeline != VK_NULL_HANDLE)
++		vkDestroyPipeline(m_device, m_antiflicker_pipeline, nullptr);
+ 
+ 	for (VkPipeline it : m_cas_pipelines)
+ 	{
+diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+index 4230238..4562d69 100644
+--- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
++++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
+@@ -444,6 +444,7 @@ private:
+ 	VkPipeline m_primid_image_setup_pipelines[2][4] = {}; // [depth][datm]
+ 	VkPipeline m_fxaa_pipeline = {};
+ 	VkPipeline m_shadeboost_pipeline = {};
++	VkPipeline m_antiflicker_pipeline = {};
+ 
+ 	VkPipeline GetConvertPipeline(ShaderConvertSelector shader) const
+ 	{
+@@ -488,6 +489,8 @@ private:
+ 	void DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
+ 		ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb) final;
+ 	void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) final;
++	bool SupportsAntiFlicker() const final { return true; }
++	bool DoAntiFlicker(GSTexture* history, GSTexture* dTex, const float params[8]) final;
+ 	void DoFXAA(GSTexture* sTex, GSTexture* dTex) final;
+ 
+ 	bool DoCAS(
+diff --git a/pcsx2/Pcsx2Config.cpp b/pcsx2/Pcsx2Config.cpp
+index 51c34b9..9a40327 100644
+--- a/pcsx2/Pcsx2Config.cpp
++++ b/pcsx2/Pcsx2Config.cpp
+@@ -873,6 +873,10 @@ bool Pcsx2Config::GSOptions::OptionsAreEqual(const GSOptions& right) const
+ 		OpEqu(ShadeBoost_Contrast) &&
+ 		OpEqu(ShadeBoost_Saturation) &&
+ 		OpEqu(ShadeBoost_Gamma) &&
++		OpEqu(AntiFlicker) &&
++		OpEqu(AntiFlicker_Threshold) &&
++		OpEqu(AntiFlicker_StartRow) &&
++		OpEqu(AntiFlicker_EndRow) &&
+ 		OpEqu(PNGCompressionLevel) &&
+ 		OpEqu(SaveDrawStart) &&
+ 		OpEqu(SaveDrawCount) &&
+@@ -1098,6 +1102,10 @@ void Pcsx2Config::GSOptions::LoadSave(SettingsWrapper& wrap)
+ 	SettingsWrapBitfield(ShadeBoost_Contrast);
+ 	SettingsWrapBitfield(ShadeBoost_Saturation);
+ 	SettingsWrapBitfield(ShadeBoost_Gamma);
++	SettingsWrapEntry(AntiFlicker);
++	SettingsWrapEntry(AntiFlicker_Threshold);
++	SettingsWrapEntry(AntiFlicker_StartRow);
++	SettingsWrapEntry(AntiFlicker_EndRow);
+ 	SettingsWrapBitfield(ExclusiveFullscreenControl);
+ 	SettingsWrapBitfieldEx(PNGCompressionLevel, "png_compression_level");
+ 	SettingsWrapBitfieldEx(SaveDrawStart, "SaveDrawStart");

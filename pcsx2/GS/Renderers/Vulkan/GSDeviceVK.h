@@ -444,6 +444,7 @@ private:
 	VkPipeline m_primid_image_setup_pipelines[2][4] = {}; // [depth][datm]
 	VkPipeline m_fxaa_pipeline = {};
 	VkPipeline m_shadeboost_pipeline = {};
+	VkPipeline m_antiflicker_pipeline = {};
 
 	VkPipeline GetConvertPipeline(ShaderConvertSelector shader) const
 	{
@@ -488,6 +489,8 @@ private:
 	void DoInterlace(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
 		ShaderInterlace shader, Filter filter, const InterlaceConstantBuffer& cb) final;
 	void DoShadeBoost(GSTexture* sTex, GSTexture* dTex, const float params[4]) final;
+	bool SupportsAntiFlicker() const final { return true; }
+	bool DoAntiFlicker(GSTexture* history, GSTexture* dTex, const float params[8]) final;
 	void DoFXAA(GSTexture* sTex, GSTexture* dTex) final;
 
 	bool DoCAS(
